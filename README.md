@@ -1,7 +1,5 @@
 # @core/once_cell — Single Assignment Cells & Lazy Values
 
-**Port of Rust's [`once_cell`](https://github.com/matklad/once_cell) v1.21.4 to Zeta.**
-
 Zero-overhead atomics via direct LLVM intrinsic calls. Smaller, faster, no std dependency.
 
 ## Quick Start
@@ -41,7 +39,7 @@ static DATA: Lazy<HashMap<String, Vec<u8>>> = Lazy::new(|| {
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `new()` | `Self` | Empty cell (const) |
+| `new()` | `Self` | Empty cell |
 | `with_value(T)` | `Self` | Pre-initialized cell |
 | `get()` | `Option<&T>` | Read if initialized |
 | `get_mut()` | `Option<&mut T>` | Mutable reference |
@@ -72,20 +70,13 @@ No blocking. Multiple threads may run `F`, but only one result wins.
 
 ## Performance
 
-- **`sync::OnceCell::get()`** — 1 atomic Acquire load (same as Rust)
-- **`sync::OnceCell::get_or_init()`** — CAS on contention, spin+yield
+- **`sync::OnceCell::get()`** — 1 atomic Acquire load
+- **`sync::OnceCell::get_or_init()`** — CAS + spin/yield on contention
 - **`unsync::OnceCell::get()`** — raw pointer read (zero atomics)
 - **`sync::Lazy`** — first access does `get_or_init`, subsequent = Acquire load
 
-No unnecessary allocations. No dynamic dispatch. Direct LLVM atomics.
-
-## Implementation Notes
-
-- State machine uses `AtomicUsize`: UNINIT(0) → PENDING(1) → INIT(2)
-- On initialization failure, resets to UNINIT for retry
-- Race types use single CAS without blocking or allocation
-- Unsafe is used minimally and only for interior mutability
+No unnecessary allocations. No dynamic dispatch.
 
 ## License
 
-MIT OR Apache-2.0
+MIT
