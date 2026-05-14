@@ -1,0 +1,6 @@
+// @core/once_cell::mod — Entry point.
+// Re-exports all public API for single import.
+
+pub mod unsync;
+pub mod sync;
+pub mod race;

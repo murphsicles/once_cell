@@ -1,0 +1,255 @@
+// @core/once_cell::unsync — Single-threaded OnceCell and Lazy.
+//
+// NOT thread-safe. Zero atomic overhead. Use only in single-threaded contexts.
+
+use std::option::Option;
+use std::result::Result;
+use std::fmt::Debug;
+
+// ─── OnceCell<T> ────────────────────────────────────────────────────────────
+
+/// A cell which can be written to only once. NOT thread-safe.
+///
+/// Provides `&T` references to contents without runtime borrow-checking.
+///
+/// # Example
+/// ```
+/// use @core/once_cell::unsync::OnceCell;
+///
+/// let cell = OnceCell::new();
+/// assert!(cell.get().is_none());
+///
+/// let val: &String = cell.get_or_init(|| "Hello".to_string());
+/// assert_eq!(*val, "Hello");
+/// ```
+pub struct OnceCell<T> {
+    /// Raw pointer to Option<T> for interior mutability.
+    /// INVARIANT: written at most once.
+    inner: *mut Option<T>,
+}
+
+impl<T> OnceCell<T> {
+    /// Creates a new empty cell.
+    pub fn new() -> Self {
+        let inner = malloc(std::mem::size_of::<Option<T>>());
+        let ptr = inner as *mut Option<T>;
+        unsafe { *ptr = Option::None; }
+        OnceCell { inner: ptr }
+    }
+
+    /// Creates a new initialized cell.
+    pub fn with_value(value: T) -> Self {
+        let inner = malloc(std::mem::size_of::<Option<T>>());
+        let ptr = inner as *mut Option<T>;
+        unsafe { *ptr = Option::Some(value); }
+        OnceCell { inner: ptr }
+    }
+
+    /// Gets a reference to the underlying value.
+    /// Returns `None` if the cell is empty.
+    pub fn get(&self) -> Option<&T> {
+        unsafe { (*self.inner).as_ref() }
+    }
+
+    /// Gets a mutable reference to the underlying value.
+    /// Requires `&mut self` — safe to violate write-once invariant.
+    pub fn get_mut(&mut self) -> Option<&mut T> {
+        unsafe { (*self.inner).as_mut() }
+    }
+
+    /// Sets the contents of this cell to `value`.
+    /// Returns `Err(value)` if already full.
+    pub fn set(&self, value: T) -> Result<(), T> {
+        match self.try_insert(value) {
+            Result::Ok(_) => Result::Ok(()),
+            Result::Err((_, value)) => Result::Err(value),
+        }
+    }
+
+    /// Like `set()`, but returns a reference to the final value.
+    pub fn try_insert(&self, value: T) -> Result<&T, (&T, T)> {
+        match self.get() {
+            Option::Some(old) => Result::Err((old, value)),
+            Option::None => {
+                let slot = unsafe { &mut *self.inner };
+                *slot = Option::Some(value);
+                Result::Ok(unsafe { slot.as_ref().unwrap_unchecked() })
+            }
+        }
+    }
+
+    /// Gets the contents, initializing with `f` if empty.
+    /// Panics on reentrant initialization.
+    pub fn get_or_init<F>(&self, f: F) -> &T
+    where
+        F: FnOnce() -> T,
+    {
+        match self.get_or_try_init(|| Result::Ok(f())) {
+            Result::Ok(val) => val,
+            Result::Err(_) => unreachable!(),  // infallible
+        }
+    }
+
+    /// Gets the contents, initializing with `f` if empty.
+    /// Returns `Err` if `f` fails. Cell remains empty on failure.
+    pub fn get_or_try_init<F, E>(&self, f: F) -> Result<&T, E>
+    where
+        F: FnOnce() -> Result<T, E>,
+    {
+        match self.get() {
+            Option::Some(val) => Result::Ok(val),
+            Option::None => {
+                let val = f()?;
+                match self.try_insert(val) {
+                    Result::Ok(ptr) => Result::Ok(ptr),
+                    Result::Err(_) => panic!("reentrant init detected"),
+                }
+            }
+        }
+    }
+
+    /// Takes the value out, resetting to uninitialized.
+    /// Requires `&mut self`.
+    pub fn take(&mut self) -> Option<T> {
+        let result = unsafe { (*self.inner).take() };
+        result
+    }
+
+    /// Consumes the cell, returning the wrapped value.
+    pub fn into_inner(self) -> Option<T> {
+        let result = unsafe { (*self.inner).take() };
+        free(self.inner as i64);
+        result
+    }
+}
+
+impl<T: Clone> Clone for OnceCell<T> {
+    fn clone(&self) -> Self {
+        match self.get() {
+            Option::Some(value) => OnceCell::with_value(value.clone()),
+            Option::None => OnceCell::new(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        match (self.get_mut(), source.get()) {
+            (Option::Some(this), Option::Some(src)) => this.clone_from(src),
+            _ => { *self = source.clone(); }
+        }
+    }
+}
+
+impl<T: PartialEq> PartialEq for OnceCell<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
+impl<T: Eq> Eq for OnceCell<T> {}
+
+impl<T> From<T> for OnceCell<T> {
+    fn from(value: T) -> Self {
+        OnceCell::with_value(value)
+    }
+}
+
+impl<T: Debug> Debug for OnceCell<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self.get() {
+            Option::Some(v) => f.debug_tuple("OnceCell").field(v).finish(),
+            Option::None => f.write_str("OnceCell(Uninit)"),
+        }
+    }
+}
+
+impl<T> Default for OnceCell<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─── Lazy<T, F> ─────────────────────────────────────────────────────────────
+
+/// A value which is initialized on first access. NOT thread-safe.
+///
+/// # Example
+/// ```
+/// use @core/once_cell::unsync::Lazy;
+///
+/// let lazy: Lazy<i32> = Lazy::new(|| 92);
+/// assert_eq!(*lazy, 92);
+/// assert_eq!(*lazy, 92);  // cached
+/// ```
+pub struct Lazy<T, F = fn() -> T> {
+    cell: OnceCell<T>,
+    init: F,
+}
+
+impl<T, F: FnOnce() -> T> Lazy<T, F> {
+    /// Creates a new lazy value with the given initializer.
+    pub fn new(init: F) -> Self {
+        Lazy {
+            cell: OnceCell::new(),
+            init: init,
+        }
+    }
+
+    /// Forces evaluation and returns a reference to the result.
+    pub fn force(this: &Lazy<T, F>) -> &T {
+        let init_ptr = &this.init as *const F;
+        this.cell.get_or_init(|| {
+            let f = unsafe { init_ptr.read() };
+            f()
+        })
+    }
+
+    /// Forces evaluation and returns a mutable reference.
+    pub fn force_mut(this: &mut Lazy<T, F>) -> &mut T {
+        match this.cell.get_mut() {
+            Option::Some(val) => val,
+            Option::None => {
+                let value = (this.init)();
+                this.cell = OnceCell::with_value(value);
+                this.cell.get_mut().unwrap_or_else(|| unreachable!())
+            }
+        }
+    }
+
+    /// Returns a reference if initialized, `None` otherwise.
+    pub fn get(this: &Lazy<T, F>) -> Option<&T> {
+        this.cell.get()
+    }
+
+    /// Returns a mutable reference if initialized, `None` otherwise.
+    pub fn get_mut(this: &mut Lazy<T, F>) -> Option<&mut T> {
+        this.cell.get_mut()
+    }
+
+    /// Consumes this Lazy, returning the value or the init function.
+    pub fn into_value(this: Lazy<T, F>) -> Result<T, F> {
+        match this.cell.into_inner() {
+            Option::Some(val) => Result::Ok(val),
+            Option::None => Result::Err(this.init),
+        }
+    }
+}
+
+impl<T: Default> Default for Lazy<T> {
+    fn default() -> Lazy<T> {
+        Lazy::new(T::default)
+    }
+}
+
+impl<T: Debug, F> Debug for Lazy<T, F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("Lazy")
+            .field("cell", &self.cell)
+            .field("init", &"..")
+            .finish()
+    }
+}
+
+// ─── Memory helpers ────────────────────────────────────────────────────────
+
+extern fn malloc(size: i64) -> i64;
+extern fn free(ptr: i64);

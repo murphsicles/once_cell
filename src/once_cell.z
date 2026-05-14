@@ -1,0 +1,23 @@
+// @core/once_cell — Single assignment cells and lazy values.
+//
+// Port of Rust's `once_cell` v1.21.4 to Zeta, with zero-overhead atomics
+// via direct LLVM intrinsic calls. Smaller, faster, no std dependency.
+//
+// # Quick Start
+//
+// ```zeta
+// use @core/once_cell::sync::OnceCell;
+//
+// static CACHE: OnceCell<Vec<String>> = OnceCell::new();
+// let data = CACHE.get_or_init(|| load_data());
+// ```
+//
+// # Modules
+//
+// - `unsync` — Single-threaded OnceCell and Lazy (no atomics, fastest)
+// - `sync`   — Thread-safe OnceCell and Lazy (lock-free fast path)
+// - `race`   — Non-blocking, first-one-wins atomic cells
+
+pub mod unsync;
+pub mod sync;
+pub mod race;

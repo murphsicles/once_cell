@@ -1,0 +1,336 @@
+// @core/once_cell::sync — Thread-safe OnceCell and Lazy.
+//
+// Lock-free fast path: a single Acquire load for `get()`.
+// On contention: CAS + spin/yield.
+// No kernel wait unless `wait()` is called.
+//
+// # Provided Types
+// - `OnceCell<T>` — thread-safe, blocking single-write cell
+// - `Lazy<T, F>`  — thread-safe lazy-initialized value, works in statics
+
+use std::option::Option;
+use std::result::Result;
+use std::fmt::Debug;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+// ─── State machine ───────────────────────────────────────────────────────────
+// 0 = UNINIT, 1 = PENDING, 2 = INIT
+
+const UNINIT: usize = 0;
+const PENDING: usize = 1;
+const INIT: usize = 2;
+
+// ─── OnceCell<T> ─────────────────────────────────────────────────────────────
+
+/// A thread-safe cell which can be written to only once.
+///
+/// Provides `&T` references without RAII guards. A read of the value
+/// establishes a happens-before relationship with the write.
+///
+/// # Example
+/// ```
+/// static CELL: OnceCell<String> = OnceCell::new();
+/// CELL.get_or_init(|| "Hello".to_string());
+/// assert!(CELL.get().is_some());
+/// ```
+pub struct OnceCell<T> {
+    state: AtomicUsize,
+    value: *mut Option<T>,
+}
+
+impl<T> OnceCell<T> {
+    /// Creates a new empty cell.
+    pub fn new() -> Self {
+        let ptr = malloc(std::mem::size_of::<Option<T>>()) as *mut Option<T>;
+        unsafe { *ptr = Option::None; }
+        OnceCell {
+            state: AtomicUsize::new(UNINIT),
+            value: ptr,
+        }
+    }
+
+    /// Creates a new initialized cell.
+    pub fn with_value(val: T) -> Self {
+        let ptr = malloc(std::mem::size_of::<Option<T>>()) as *mut Option<T>;
+        unsafe { *ptr = Option::Some(val); }
+        OnceCell {
+            state: AtomicUsize::new(INIT),
+            value: ptr,
+        }
+    }
+
+    // ── Readers ──
+
+    /// Gets the reference to the underlying value.
+    /// Returns `None` if the cell is empty. Never blocks.
+    pub fn get(&self) -> Option<&T> {
+        if self.is_initialized() {
+            Option::Some(unsafe { self.get_unchecked() })
+        } else {
+            Option::None
+        }
+    }
+
+    /// Returns `true` if the cell has been initialized.
+    pub fn is_initialized(&self) -> bool {
+        self.state.load(Ordering::Acquire) == INIT
+    }
+
+    /// Gets the underlying value without checking initialization.
+    /// # Safety
+    /// Caller must ensure the cell is initialized and synchronized.
+    pub unsafe fn get_unchecked(&self) -> &T {
+        let slot = &*self.value;
+        slot.as_ref().unwrap_unchecked()
+    }
+
+    // ── Writers ──
+
+    /// Sets the contents to `value`. Returns `Err(value)` if already full.
+    pub fn set(&self, value: T) -> Result<(), T> {
+        match self.try_insert(value) {
+            Result::Ok(_) => Result::Ok(()),
+            Result::Err((_, val)) => Result::Err(val),
+        }
+    }
+
+    /// Like `set()`, but returns a reference to the final value.
+    pub fn try_insert(&self, value: T) -> Result<&T, (&T, T)> {
+        let mut val = Option::Some(value);
+        let res = self.get_or_init(|| unsafe { val.take().unwrap_unchecked() });
+        match val {
+            Option::None => Result::Ok(res),
+            Option::Some(v) => Result::Err((res, v)),
+        }
+    }
+
+    // ── Init ──
+
+    /// Gets the contents, initializing with `f` if empty.
+    /// Only one `f` will be executed. Other threads block until it completes.
+    /// Reentrant init will deadlock.
+    pub fn get_or_init<F>(&self, f: F) -> &T
+    where
+        F: FnOnce() -> T,
+    {
+        match self.get_or_try_init(|| Result::Ok(f())) {
+            Result::Ok(val) => val,
+            Result::Err(_) => unreachable!(),
+        }
+    }
+
+    /// Gets the contents, initializing with `f` if empty.
+    /// If `f` fails, the cell remains empty for others to try again.
+    pub fn get_or_try_init<F, E>(&self, f: F) -> Result<&T, E>
+    where
+        F: FnOnce() -> Result<T, E>,
+    {
+        // Fast path: already initialized
+        if self.is_initialized() {
+            return Result::Ok(unsafe { self.get_unchecked() });
+        }
+
+        // Try to become the initializer
+        let cas_result = self.state.compare_exchange(
+            UNINIT, PENDING,
+            Ordering::Acquire, Ordering::Relaxed,
+        );
+
+        match cas_result {
+            Result::Ok(_) => {
+                // We won the race. Initialize the value.
+                let slot = unsafe { &mut *self.value };
+                match f() {
+                    Result::Ok(val) => {
+                        *slot = Option::Some(val);
+                        self.state.store(INIT, Ordering::Release);
+                        Result::Ok(unsafe { self.get_unchecked() })
+                    }
+                    Result::Err(e) => {
+                        // Reset so another thread can try
+                        self.state.store(UNINIT, Ordering::Release);
+                        Result::Err(e)
+                    }
+                }
+            }
+            Result::Err(_) => {
+                // Someone else is initializing. Wait until INIT.
+                loop {
+                    let s = self.state.load(Ordering::Acquire);
+                    if s == INIT {
+                        return Result::Ok(unsafe { self.get_unchecked() });
+                    }
+                    // Yield to avoid busy-spinning on hyperthreads
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+
+    /// Blocks the current thread until the cell is initialized.
+    pub fn wait(&self) -> &T {
+        while !self.is_initialized() {
+            std::thread::yield_now();
+        }
+        unsafe { self.get_unchecked() }
+    }
+
+    // ── Mutation (requires &mut self) ──
+
+    /// Gets a mutable reference. Returns `None` if empty.
+    pub fn get_mut(&mut self) -> Option<&mut T> {
+        unsafe { (*self.value).as_mut() }
+    }
+
+    /// Takes the value out, resetting to uninitialized.
+    pub fn take(&mut self) -> Option<T> {
+        let result = unsafe { (*self.value).take() };
+        self.state.store(UNINIT, Ordering::Relaxed);
+        result
+    }
+
+    /// Consumes the cell, returning the wrapped value.
+    pub fn into_inner(self) -> Option<T> {
+        let result = unsafe { (*self.value).take() };
+        free(self.value as i64);
+        result
+    }
+}
+
+impl<T: Clone> Clone for OnceCell<T> {
+    fn clone(&self) -> Self {
+        match self.get() {
+            Option::Some(value) => Self::with_value(value.clone()),
+            Option::None => Self::new(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        match (self.get_mut(), source.get()) {
+            (Option::Some(this), Option::Some(src)) => this.clone_from(src),
+            _ => { *self = source.clone(); }
+        }
+    }
+}
+
+impl<T> From<T> for OnceCell<T> {
+    fn from(value: T) -> Self {
+        Self::with_value(value)
+    }
+}
+
+impl<T: PartialEq> PartialEq for OnceCell<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
+impl<T: Eq> Eq for OnceCell<T> {}
+
+impl<T: Debug> Debug for OnceCell<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self.get() {
+            Option::Some(v) => f.debug_tuple("OnceCell").field(v).finish(),
+            Option::None => f.write_str("OnceCell(Uninit)"),
+        }
+    }
+}
+
+impl<T> Default for OnceCell<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─── Lazy<T, F> — Thread-Safe ────────────────────────────────────────────────
+
+/// A thread-safe lazy-initialized value, usable in statics.
+///
+/// # Example
+/// ```
+/// use @core/once_cell::sync::Lazy;
+/// use std::collections::HashMap;
+///
+/// static MAP: Lazy<HashMap<i32, String>> = Lazy::new(|| {
+///     let mut m = HashMap::new();
+///     m.insert(13, "Spica".to_string());
+///     m
+/// });
+/// ```
+pub struct Lazy<T, F = fn() -> T> {
+    cell: OnceCell<T>,
+    init: F,
+}
+
+impl<T, F> Lazy<T, F> {
+    /// Creates a new lazy value with the given initializer.
+    pub fn new(init: F) -> Self {
+        Lazy {
+            cell: OnceCell::new(),
+            init: init,
+        }
+    }
+
+    /// Consumes this Lazy, returning the value or the init function.
+    pub fn into_value(this: Lazy<T, F>) -> Result<T, F> {
+        match this.cell.into_inner() {
+            Option::Some(val) => Result::Ok(val),
+            Option::None => Result::Err(this.init),
+        }
+    }
+}
+
+impl<T, F: FnOnce() -> T> Lazy<T, F> {
+    /// Forces evaluation, returns a reference to the result.
+    pub fn force(this: &Lazy<T, F>) -> &T {
+        // Safety: get_or_init guarantees single-threaded execution of the closure.
+        // We read init through a raw pointer because FnOnce consumes the value.
+        let init_ptr = &this.init as *const F;
+        this.cell.get_or_init(|| {
+            let f = unsafe { init_ptr.read() };
+            f()
+        })
+    }
+
+    /// Forces evaluation, returns a mutable reference.
+    pub fn force_mut(this: &mut Lazy<T, F>) -> &mut T {
+        match this.cell.get_mut() {
+            Option::Some(val) => val,
+            Option::None => {
+                let value = (this.init)();
+                this.cell = OnceCell::with_value(value);
+                this.cell.get_mut().unwrap_or_else(|| unreachable!())
+            }
+        }
+    }
+
+    /// Returns a reference if initialized, `None` otherwise.
+    pub fn get(this: &Lazy<T, F>) -> Option<&T> {
+        this.cell.get()
+    }
+
+    /// Returns a mutable reference if initialized, `None` otherwise.
+    pub fn get_mut(this: &mut Lazy<T, F>) -> Option<&mut T> {
+        this.cell.get_mut()
+    }
+}
+
+impl<T: Default> Default for Lazy<T> {
+    fn default() -> Lazy<T> {
+        Lazy::new(T::default)
+    }
+}
+
+impl<T: Debug, F> Debug for Lazy<T, F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("Lazy")
+            .field("cell", &self.cell)
+            .field("init", &"..")
+            .finish()
+    }
+}
+
+// ─── Memory helpers ────────────────────────────────────────────────────────
+
+extern fn malloc(size: i64) -> i64;
+extern fn free(ptr: i64);
