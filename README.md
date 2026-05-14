@@ -7,8 +7,8 @@ Zero-overhead atomics via direct LLVM intrinsic calls. Smaller, faster, no std d
 ## Quick Start
 
 ```zeta
-use @core/once_cell::sync::OnceCell;
-use @core/once_cell::sync::Lazy;
+use zorb @core/once_cell::sync::OnceCell;
+use zorb @core/once_cell::sync::Lazy;
 
 // Global with lazy initialization
 static CONFIG: OnceCell<Config> = OnceCell::new();

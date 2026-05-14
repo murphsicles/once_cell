@@ -248,7 +248,7 @@ impl<T> Default for OnceCell<T> {
 ///
 /// # Example
 /// ```
-/// use @core/once_cell::sync::Lazy;
+/// use zorb @core/once_cell::sync::Lazy;
 /// use std::collections::HashMap;
 ///
 /// static MAP: Lazy<HashMap<i32, String>> = Lazy::new(|| {
