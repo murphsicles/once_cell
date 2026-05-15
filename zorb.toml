@@ -1,6 +1,6 @@
 [package]
 name = "@core/once_cell"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2026"
 authors = ["Zak Murphy <zak@z-lang.org>"]
 description = "Single assignment cells and lazy values for Zeta."
