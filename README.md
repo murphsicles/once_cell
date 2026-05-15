@@ -1,6 +1,6 @@
 # @core/once_cell — Single Assignment Cells & Lazy Values
 
-Zero-overhead atomics via direct LLVM intrinsic calls. Smaller, faster, no std dependency.
+Zero-overhead atomics via direct LLVM intrinsic calls. No std dependency.
 
 ## Quick Start
 

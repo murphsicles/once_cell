@@ -197,6 +197,17 @@ impl<T> OnceCell<T> {
     }
 }
 
+// ── Drop ──
+
+impl<T> Drop for OnceCell<T> {
+    /// Frees the heap-allocated value slot.
+    fn drop(&mut self) {
+        // Drop the inner value if present, then free memory
+        unsafe { (*self.value).take(); }
+        free(self.value as i64);
+    }
+}
+
 impl<T: Clone> Clone for OnceCell<T> {
     fn clone(&self) -> Self {
         match self.get() {
@@ -259,23 +270,28 @@ impl<T> Default for OnceCell<T> {
 /// ```
 pub struct Lazy<T, F = fn() -> T> {
     cell: OnceCell<T>,
-    init: F,
+    /// Stores init as Option<F> so we can swap it out soundly.
+    init: *mut Option<F>,
 }
 
 impl<T, F> Lazy<T, F> {
     /// Creates a new lazy value with the given initializer.
     pub fn new(init: F) -> Self {
+        let init_box = malloc(std::mem::size_of::<Option<F>>()) as *mut Option<F>;
+        unsafe { *init_box = Option::Some(init); }
         Lazy {
             cell: OnceCell::new(),
-            init: init,
+            init: init_box,
         }
     }
 
     /// Consumes this Lazy, returning the value or the init function.
     pub fn into_value(this: Lazy<T, F>) -> Result<T, F> {
-        match this.cell.into_inner() {
-            Option::Some(val) => Result::Ok(val),
-            Option::None => Result::Err(this.init),
+        let init = unsafe { (*this.init).take() };
+        let val = this.cell.into_inner();
+        match val {
+            Option::Some(v) => Result::Ok(v),
+            Option::None => Result::Err(init.unwrap_or_else(|| panic!("Lazy previously poisoned"))),
         }
     }
 }
@@ -283,11 +299,11 @@ impl<T, F> Lazy<T, F> {
 impl<T, F: FnOnce() -> T> Lazy<T, F> {
     /// Forces evaluation, returns a reference to the result.
     pub fn force(this: &Lazy<T, F>) -> &T {
-        // Safety: get_or_init guarantees single-threaded execution of the closure.
-        // We read init through a raw pointer because FnOnce consumes the value.
-        let init_ptr = &this.init as *const F;
+        // Sound: get_or_init guarantees single-threaded execution of the closure.
+        // We swap out the Option<F> to move F without byte-copying.
         this.cell.get_or_init(|| {
-            let f = unsafe { init_ptr.read() };
+            let f = unsafe { (*this.init).take() }
+                .unwrap_or_else(|| panic!("Lazy instance has previously been poisoned"));
             f()
         })
     }
@@ -297,7 +313,9 @@ impl<T, F: FnOnce() -> T> Lazy<T, F> {
         match this.cell.get_mut() {
             Option::Some(val) => val,
             Option::None => {
-                let value = (this.init)();
+                let f = unsafe { (*this.init).take() }
+                    .unwrap_or_else(|| panic!("Lazy instance has previously been poisoned"));
+                let value = f();
                 this.cell = OnceCell::with_value(value);
                 this.cell.get_mut().unwrap_or_else(|| unreachable!())
             }
@@ -312,6 +330,14 @@ impl<T, F: FnOnce() -> T> Lazy<T, F> {
     /// Returns a mutable reference if initialized, `None` otherwise.
     pub fn get_mut(this: &mut Lazy<T, F>) -> Option<&mut T> {
         this.cell.get_mut()
+    }
+}
+
+impl<T, F> Drop for Lazy<T, F> {
+    /// Frees the heap-allocated init slot.
+    fn drop(&mut self) {
+        unsafe { (*self.init).take(); }
+        free(self.init as i64);
     }
 }
 
